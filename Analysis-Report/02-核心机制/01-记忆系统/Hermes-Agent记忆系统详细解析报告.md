@@ -982,3 +982,114 @@ Hermes Agent 的记忆系统可以看成三层：
    - 写入多数是 best-effort async，复杂 provider 自己负责可靠性和 session 切换。
 
 从设计角度看，Hermes 没有把所有长期记忆都强行塞进一个数据库模型，而是保留一个稳定、透明、低成本的内置记忆，再通过 `MemoryProvider` 接口接入更重的长期记忆系统。这个分层是它最重要的架构点：**内置记忆保证基本可用和可解释，外部 provider 提供更强召回和建模能力，主循环通过严格的注入和清理边界把二者接到同一个 Agent 体验里。**
+
+## 18. 相关源码阅读建议顺序
+
+这一节按“先理解最小闭环，再理解扩展机制”的顺序阅读。建议每读完一层，都回到 `run_agent.py` 看它在主循环里的接入点，否则容易把记忆系统误解成几个孤立模块。
+
+### 18.1 第一轮：先读内置文件记忆闭环
+
+1. `tools/memory_tool.py`
+   - 先看 `MemoryStore`，理解 `MEMORY.md` / `USER.md` 这两个文件目标。
+   - 重点看 frozen snapshot、live entries、`add` / `replace` / `remove` 的数据流。
+   - 注意分隔符、字符限制、文件锁、原子写、安全扫描和 `format_for_system_prompt()`。
+
+2. `toolsets.py`
+   - 确认 `memory` 是核心工具，默认会进入大多数平台的工具集。
+   - 这一步能解释为什么普通 CLI / gateway 会天然具备内置 memory 工具。
+
+3. `model_tools.py`
+   - 看 `_AGENT_LOOP_TOOLS` / legacy toolset map 中对 `memory` 的处理。
+   - 重点理解：`memory` 是 agent-loop tool，会被 `run_agent.py` 拦截，不完全等同于普通 registry 工具。
+
+### 18.2 第二轮：读主循环如何注入和执行 memory
+
+4. `run_agent.py` 的初始化区域
+   - 看 `_memory_store`、`_memory_enabled`、`_user_profile_enabled` 的创建和开关。
+   - 同时看 `skip_memory=True` 的分支，理解 batch、cron、curator、子 agent 为什么会绕过记忆。
+
+5. `run_agent.py::_build_system_prompt()`
+   - 看 `MEMORY_GUIDANCE`、内置 `MEMORY.md` / `USER.md` 快照、外部 provider system prompt block 的拼接顺序。
+   - 重点理解 frozen snapshot：本 turn 中新写入的内置记忆不会立刻改变当前 system prompt。
+
+6. `run_agent.py` 的 tool-call 执行路径
+   - 找 `function_name == "memory"` 的特殊处理。
+   - 看 `self._memory_store.add_entry()` / replace / remove 如何被调用。
+   - 注意内置 memory 成功写入后，如何调用外部 provider 的 `on_memory_write()` 做桥接。
+
+7. `run_agent.py` 的 turn 收尾逻辑
+   - 看 `_sync_external_memory_for_turn()`。
+   - 关注 interrupted turn、final response、prefetch queue、session history 之间的关系。
+
+### 18.3 第三轮：读外部 provider 抽象层
+
+8. `agent/memory_provider.py`
+   - 这是所有外部记忆插件的 contract。
+   - 重点看 `initialize()`、`sync_turn()`、`prefetch()`、`on_memory_write()`、`on_session_end()`、`shutdown()`。
+   - 同时注意 optional hooks：session switch、context compression、system prompt、tool schemas。
+
+9. `agent/memory_manager.py`
+   - 重点看为什么只允许一个 active external provider。
+   - 看 `prefetch_all()`、`sync_all()`、`route_tool_call()`、`get_all_tool_schemas()`。
+   - 特别关注 `<memory-context>` 围栏、provider 内容清理、StreamingContextScrubber。
+
+10. `plugins/memory/__init__.py`
+    - 看 provider 发现、加载、配置读取和 active provider 选择。
+    - 这一步把“抽象类”与“插件目录”连接起来。
+
+### 18.4 第四轮：挑 provider 深读
+
+11. `plugins/memory/honcho/`
+    - 适合学习 user modeling / session peer / dialectic prompt。
+    - 重点读 `client.py` 和 `session.py`，理解外部服务型记忆如何映射 Hermes 的 session。
+
+12. `plugins/memory/hindsight/`
+    - 适合学习 session transcript / document 边界。
+    - 重点看它如何同步 turn、召回上下文、处理持久会话。
+
+13. `plugins/memory/holographic/`
+    - 适合学习本地结构化记忆设计。
+    - 重点看 `store.py`、`retrieval.py`，理解事实、实体、向量召回或图式组织如何本地化。
+
+14. `plugins/memory/retaindb/`
+    - 适合学习可靠异步写队列。
+    - 重点看 pending 写入、flush、commit、shutdown 时如何降低丢数据概率。
+
+15. 其他 provider 快速横向比较
+    - `mem0`：看 SaaS 记忆 API 的轻量适配方式。
+    - `supermemory`：看 ingestion / search 风格的外部知识库接入。
+    - `openviking`：看本地或半本地后端的初始化约束。
+    - `byterover`：看项目型知识库 provider 如何暴露工具。
+
+### 18.5 第五轮：读配置、CLI 和 UI 入口
+
+16. `hermes_cli/config.py`
+    - 看 `memory` 默认配置结构。
+    - 理解 provider、enabled、路径、API key、setup 相关配置如何进入运行时。
+
+17. `hermes_cli/memory_setup.py`
+    - 看 setup wizard 如何引导用户启用 provider。
+    - 重点看 provider 的 `post_setup()` 如何被调用。
+
+18. `hermes_cli/main.py` / `hermes_cli/plugins_cmd.py`
+    - 看 CLI 如何列出、配置、启用插件。
+    - 关注 memory provider CLI command 的发现机制。
+
+19. `hermes_cli/web_server.py` 和 `web/src/pages/PluginsPage.tsx`
+    - 看 Dashboard 如何展示和切换 memory provider。
+    - 这部分有助于理解配置如何从 UI 回写到 `config.yaml`。
+
+### 18.6 第六轮：用问题反查源码
+
+读完上面文件后，可以用下面几个问题反向检查理解是否完整：
+
+1. 用户调用 `memory(action="add", target="memory")` 后，当前 turn 的 system prompt 会不会立刻变化？
+2. 外部 provider 的 `prefetch()` 内容为什么不能进入持久 conversation history？
+3. 为什么 `sync_turn()` 通常是 best-effort，而不是主循环强一致依赖？
+4. `on_session_end()`、`commit_memory_session()`、`shutdown_memory_provider()` 的边界分别是什么？
+5. context compression 前后为什么要通知 provider？
+6. 如果同时存在内置 memory 和 Honcho，用户显式写入的 fact 会走几条路径？
+7. 子 agent、batch、cron 默认跳过 memory 的目的是什么？
+8. 如果 provider 返回了带 `<memory-context>` 的内容，Hermes 如何避免它泄漏给用户或污染历史？
+
+如果这些问题都能从源码中找到答案，基本就掌握了 Hermes 记忆系统的主体设计。
